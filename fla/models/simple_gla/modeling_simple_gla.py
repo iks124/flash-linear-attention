@@ -60,11 +60,11 @@ class SimpleGLABlock(GradientCheckpointingLayer):
                 feature_map=config.feature_map,
                 use_short_conv=config.use_short_conv,
                 conv_size=config.conv_size,
-                use_output_gate=config.use_output_gate,
+                conv_bias=config.conv_bias,
                 gate_fn=config.hidden_act,
                 elementwise_affine=config.elementwise_affine,
                 norm_eps=config.norm_eps,
-                clamp_min=config.clamp_min,
+                gate_logit_normalizer=config.gate_logit_normalizer,
                 fuse_norm=config.fuse_norm,
                 layer_idx=layer_idx,
             )

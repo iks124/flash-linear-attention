@@ -1,9 +1,9 @@
-
 import warnings
+
 from transformers.configuration_utils import PretrainedConfig
 
-class SimpleGLAConfig(PretrainedConfig):
 
+class SimpleGLAConfig(PretrainedConfig):
     model_type = 'simple_gla'
     keys_to_ignore_at_inference = ['past_key_values']
 
@@ -11,24 +11,22 @@ class SimpleGLAConfig(PretrainedConfig):
         self,
         hidden_size: int = 2048,
         expand_k: float = 0.5,
-        expand_v: float = 1.,
+        expand_v: float = 1.0,
         hidden_ratio: int | None = 4,
         intermediate_size: int | None = None,
         num_hidden_layers: int = 24,
         num_heads: int = 4,
         num_kv_heads: int | None = None,
         feature_map: str | None = None,
-        attn_mode: str = "chunk",
+        attn_mode: str = 'chunk',
         use_short_conv: bool = False,
         conv_size: int = 4,
-        use_output_gate: bool = True,
-        clamp_min: float | None = None,
-        hidden_act: str = "swish",
+        conv_bias: bool = False,
+        gate_logit_normalizer: int = 16,
+        hidden_act: str = 'swish',
         max_position_embeddings: int = 2048,
         elementwise_affine: bool | None = True,
         norm_eps: float = 1e-6,
-        use_gk: bool = True,
-        use_gv: bool = False,
         attn: dict | None = None,
         use_cache: bool = True,
         pad_token_id: int | None = None,
@@ -56,14 +54,12 @@ class SimpleGLAConfig(PretrainedConfig):
         self.attn_mode = attn_mode
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
-        self.use_output_gate = use_output_gate
-        self.clamp_min = clamp_min
+        self.conv_bias = conv_bias
+        self.gate_logit_normalizer = gate_logit_normalizer
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.elementwise_affine = elementwise_affine
         self.norm_eps = norm_eps
-        self.use_gk = use_gk
-        self.use_gv = use_gv
         self.attn = attn
         self.use_cache = use_cache
         self.initializer_range = initializer_range
@@ -76,15 +72,27 @@ class SimpleGLAConfig(PretrainedConfig):
         self.vocab_size = vocab_size
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
-            raise ValueError("`fuse_cross_entropy` and `fuse_linear_cross_entropy` cannot be True at the same time.")
-        
+            raise ValueError(
+                '`fuse_cross_entropy` and `fuse_linear_cross_entropy` cannot be True at the same time.',
+            )
+        if fuse_linear_cross_entropy:
+            warnings.warn(
+                '`fuse_linear_cross_entropy` is enabled, which can improves memory efficiency '
+                'at the potential cost of reduced precision. '
+                'If you observe issues like loss divergence, consider disabling this setting.',
+            )
+
         if attn is not None:
             if not isinstance(attn, dict):
-                raise ValueError("attn must be a dictionary")
+                raise ValueError('attn must be a dictionary')
+            if 'layers' not in attn:
+                raise ValueError('Layer indices must be provided to initialize hybrid attention layers')
+            if 'num_heads' not in attn:
+                raise ValueError('Number of heads must be provided to initialize hybrid attention layers')
             attn['num_kv_heads'] = attn.get('num_kv_heads', attn['num_heads'])
             attn['qkv_bias'] = attn.get('qkv_bias', False)
             attn['window_size'] = attn.get('window_size', None)
-            attn['rope_theta'] = attn.get('rope_theta', 10000.)
+            attn['rope_theta'] = attn.get('rope_theta', 10000.0)
 
         super().__init__(
             pad_token_id=pad_token_id,
