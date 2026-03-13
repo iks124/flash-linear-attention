@@ -40,6 +40,12 @@ class SimpleGLAConfig(PretrainedConfig):
         fuse_linear_cross_entropy: bool = False,
         use_l2warp: bool = False,
         vocab_size: int = 32000,
+        use_dual_path_memory: bool = True,
+        memory_layers: list[int] | None = None,
+        working_memory_window: int = 256,
+        compression_segment_length: int = 64,
+        memory_slots_per_segment: int = 2,
+        max_compressed_slots: int = 512,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -70,6 +76,12 @@ class SimpleGLAConfig(PretrainedConfig):
         self.fuse_linear_cross_entropy = fuse_linear_cross_entropy
         self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
+        self.use_dual_path_memory = use_dual_path_memory
+        self.memory_layers = memory_layers
+        self.working_memory_window = working_memory_window
+        self.compression_segment_length = compression_segment_length
+        self.memory_slots_per_segment = memory_slots_per_segment
+        self.max_compressed_slots = max_compressed_slots
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(
@@ -93,6 +105,10 @@ class SimpleGLAConfig(PretrainedConfig):
             attn['qkv_bias'] = attn.get('qkv_bias', False)
             attn['window_size'] = attn.get('window_size', None)
             attn['rope_theta'] = attn.get('rope_theta', 10000.0)
+
+        if self.memory_layers is None:
+            self.memory_layers = [num_hidden_layers - 1]
+        self.memory_layers = sorted(set(self.memory_layers))
 
         super().__init__(
             pad_token_id=pad_token_id,
