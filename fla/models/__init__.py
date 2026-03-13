@@ -1,4 +1,3 @@
-
 from fla.models.abc import ABCConfig, ABCForCausalLM, ABCModel
 from fla.models.bitnet import BitNetConfig, BitNetForCausalLM, BitNetModel
 from fla.models.comba import CombaConfig, CombaForCausalLM, CombaModel
@@ -12,6 +11,7 @@ from fla.models.forgetting_transformer import (
 from fla.models.gated_deltanet import GatedDeltaNetConfig, GatedDeltaNetForCausalLM, GatedDeltaNetModel
 from fla.models.gated_deltaproduct import GatedDeltaProductConfig, GatedDeltaProductForCausalLM, GatedDeltaProductModel
 from fla.models.gla import GLAConfig, GLAForCausalLM, GLAModel
+from fla.models.simple_gla import SimpleGLAConfig, SimpleGLAForCausalLM, SimpleGLAModel
 from fla.models.gsa import GSAConfig, GSAForCausalLM, GSAModel
 from fla.models.hgrn import HGRNConfig, HGRNForCausalLM, HGRNModel
 from fla.models.hgrn2 import HGRN2Config, HGRN2ForCausalLM, HGRN2Model
@@ -55,6 +55,9 @@ __all__ = [
     'GLAConfig',
     'GLAForCausalLM',
     'GLAModel',
+    'SimpleGLAConfig',
+    'SimpleGLAForCausalLM',
+    'SimpleGLAModel',
     'GSAConfig',
     'GSAForCausalLM',
     'GSAModel',
