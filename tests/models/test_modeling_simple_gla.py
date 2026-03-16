@@ -129,9 +129,9 @@ def test_simple_gla_memory_building_blocks_shape_contract_showcase():
     hidden_size = 32
     batch, seq_len, slots = 2, 6, 3
 
-    scorer = SegmentScorer(hidden_size)
-    compressor = SegmentCompressor(hidden_size, slots_per_segment=slots)
-    reader = MemoryReader(hidden_size)
+    scorer = SegmentScorer(hidden_size).to(TEST_DEVICE).eval()
+    compressor = SegmentCompressor(hidden_size, slots_per_segment=slots).to(TEST_DEVICE).eval()
+    reader = MemoryReader(hidden_size).to(TEST_DEVICE).eval()
 
     segment_states = torch.randn(batch, seq_len, hidden_size, device=TEST_DEVICE)
     query_states = torch.randn(batch, 4, hidden_size, device=TEST_DEVICE)

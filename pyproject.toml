@@ -39,6 +39,9 @@ log_cli_level = "INFO"
 pythonpath = [
   "."
 ]
+markers = [
+  "gpu: requires CUDA + flash_attn",
+]
 
 [tool.ruff]
 target-version = "py310"
