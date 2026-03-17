@@ -104,12 +104,14 @@ class MemoryCache(Cache):
         self._raw_buffer:    dict[int, torch.Tensor | None] = {}
         self._memory_tokens: dict[int, torch.Tensor | None] = {}
         self._segment_count: dict[int, int] = {}
+        self._hidden_buffer: dict[int, torch.Tensor | None] = {}  # recent W hidden states for pressure
 
     def _ensure_layer(self, layer_idx: int) -> None:
         if layer_idx not in self._raw_buffer:
             self._raw_buffer[layer_idx]    = None
             self._memory_tokens[layer_idx] = None
             self._segment_count[layer_idx] = 0
+            self._hidden_buffer[layer_idx] = None
 
     def get_layer_memory(self, layer_idx: int) -> dict[str, Any]:
         self._ensure_layer(layer_idx)
@@ -117,6 +119,7 @@ class MemoryCache(Cache):
             'raw_buffer':    self._raw_buffer[layer_idx],
             'memory_tokens': self._memory_tokens[layer_idx],
             'segment_count': self._segment_count[layer_idx],
+            'hidden_buffer': self._hidden_buffer[layer_idx],
         }
 
     def update_layer_memory(
@@ -125,11 +128,37 @@ class MemoryCache(Cache):
         raw_buffer:    torch.Tensor | None,
         memory_tokens: torch.Tensor | None,
         segment_count: int,
+        hidden_buffer: torch.Tensor | None = None,
     ) -> None:
         self._ensure_layer(layer_idx)
         self._raw_buffer[layer_idx]    = raw_buffer
         self._memory_tokens[layer_idx] = memory_tokens
         self._segment_count[layer_idx] = segment_count
+        self._hidden_buffer[layer_idx] = hidden_buffer
+
+    def detach_(self) -> 'MemoryCache':
+        """
+        Detach all stored tensors in-place (truncated BPTT).
+
+        Detaches both the KV cache (attn_state in each FLALayer) and the memory
+        compression state (memory_tokens, raw_buffer, hidden_buffer).  Call this
+        after each training chunk to break cross-chunk gradient chains.
+
+        Under FSDP2 this prevents 'storage size 0' errors that occur when
+        SegmentCompressor parameters gathered for chunk N are freed before
+        chunk N+1's backward tries to walk through them.
+        """
+        # KV cache lives in FLALayer.state["attn_state"] (sliding window already
+        # handled by FLALayer.update via cache_kwargs["window_size"]).
+        for layer in self.layers:
+            if layer.state is not None and layer.state.get('attn_state') is not None:
+                layer.state['attn_state'] = tuple(t.detach() for t in layer.state['attn_state'])
+        # Memory compression state
+        for d in (self._memory_tokens, self._raw_buffer, self._hidden_buffer):
+            for k, t in d.items():
+                if t is not None:
+                    d[k] = t.detach()
+        return self
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -381,12 +410,18 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
 
     def _compute_attention_pressure(
         self,
-        hidden_states: torch.Tensor,  # (B, L_cur, C)  current forward's output
-        buffer:        torch.Tensor,  # (B, L_buf, C)
-    ) -> torch.Tensor:                # (L_buf,)  per-position pressure ∈ [0, 1]
+        hidden_states: torch.Tensor,          # (B, L_cur, C)  current forward's output
+        buffer:        torch.Tensor,          # (B, L_buf, C)
+        hidden_buffer: torch.Tensor | None,   # (B, ≤W, C)  cached recent hidden states
+    ) -> torch.Tensor:                        # (L_buf,)  per-position pressure ∈ [0, 1]
         """
         Estimate how much each buffer position is referenced by the most
         recent W tokens of the current context.
+
+        Uses hidden_buffer (cached hidden states from previous steps) concatenated
+        with the current hidden_states to form a W-token context window.  This
+        ensures decode-time pressure signals are as rich as prefill-time signals
+        even when hidden_states contains only a single new token.
 
         Reuses self.attn.q_proj / self.attn.k_proj; no extra parameters needed.
         Handles grouped-query attention (num_kv_heads ≠ num_heads) transparently.
@@ -397,14 +432,20 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
         """
         cfg = self.config
         B, L_buf, _ = buffer.shape
-        W = min(cfg.attention_pressure_window, hidden_states.shape[1])
+
+        # Combine cached history with current tokens to get up to W context tokens
+        if hidden_buffer is not None:
+            context = torch.cat([hidden_buffer, hidden_states], dim=1)  # (B, ≤2W, C)
+        else:
+            context = hidden_states
+        W = min(cfg.attention_pressure_window, context.shape[1])
 
         H  = self.attn.num_heads
         Kh = self.attn.num_kv_heads
         Dh = self.attn.head_dim
 
         # Project the W most recent tokens as queries, all buffer tokens as keys
-        q = self.attn.q_proj(hidden_states[:, -W:])  # (B, W,   H*Dh)
+        q = self.attn.q_proj(context[:, -W:])  # (B, W,   H*Dh)
         k = self.attn.k_proj(buffer)                  # (B, L_buf, Kh*Dh)
 
         q = q.view(B, W,     H,  Dh).permute(0, 2, 1, 3)   # (B, H,  W,   Dh)
@@ -423,8 +464,9 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
 
     def _find_compress_boundary(
         self,
-        buffer:        torch.Tensor,  # (B, L_buf, C)
-        hidden_states: torch.Tensor,  # (B, L_cur, C)  current context
+        buffer:        torch.Tensor,          # (B, L_buf, C)
+        hidden_states: torch.Tensor,          # (B, L_cur, C)  current context
+        hidden_buffer: torch.Tensor | None,   # (B, ≤W, C)  cached recent hidden states
     ) -> int | None:
         """
         Two-layer compression decision.
@@ -447,7 +489,7 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
 
         # ── Layer 1: Attention pressure frontier ──────────────────────────
         with torch.no_grad():
-            pressure = self._compute_attention_pressure(hidden_states, buffer)
+            pressure = self._compute_attention_pressure(hidden_states, buffer, hidden_buffer)
 
         # pressure_frontier = leftmost position with HIGH pressure
         # = how many tokens from the left are safe to compress
@@ -550,23 +592,24 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
         buffer:        torch.Tensor,
         memory_tokens: torch.Tensor | None,
         segment_count: int,
-        hidden_states: torch.Tensor,   # current context; unchanged across recursion
+        hidden_states: torch.Tensor,          # current context; same pressure signal each iteration
+        hidden_buffer: torch.Tensor | None,   # cached recent hidden states for pressure
     ) -> tuple[torch.Tensor, torch.Tensor | None, int]:
         """
-        Greedy left-to-right compression loop.
-        Compresses the oldest segment first; recurses until the buffer contains
+        Greedy left-to-right compression loop (iterative).
+        Compresses the oldest segment first; loops until the buffer contains
         no more complete segments.
-        `hidden_states` is passed unchanged so every boundary decision uses
-        the same current-context pressure signal.
+        `hidden_states` and `hidden_buffer` are kept fixed so every boundary
+        decision uses the same current-context pressure signal.
         """
-        compress_to = self._find_compress_boundary(buffer, hidden_states)
-        if compress_to is None:
-            return buffer, memory_tokens, segment_count
-
-        buffer, memory_tokens, segment_count = self._compress_one_segment(
-            buffer, memory_tokens, segment_count, compress_to
-        )
-        return self._try_compress(buffer, memory_tokens, segment_count, hidden_states)
+        while True:
+            compress_to = self._find_compress_boundary(buffer, hidden_states, hidden_buffer)
+            if compress_to is None:
+                break
+            buffer, memory_tokens, segment_count = self._compress_one_segment(
+                buffer, memory_tokens, segment_count, compress_to
+            )
+        return buffer, memory_tokens, segment_count
 
     def _update_memory(
         self,
@@ -580,18 +623,29 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
           • As a pressure probe (non-detached, wrapped in torch.no_grad inside
             _compute_attention_pressure) to decide compression boundaries.
           • As detached states appended to the raw buffer.
+
+        hidden_buffer accumulates the most recent W hidden states across forward
+        calls so that decode-time pressure signals (where hidden_states has only
+        1 token) are as informative as prefill-time signals.
         """
-        state         = memory_cache.get_layer_memory(self.layer_idx)
+        cfg   = self.config
+        state = memory_cache.get_layer_memory(self.layer_idx)
+
         buffer        = self._cat(state['raw_buffer'], hidden_states.detach())
         memory_tokens = state['memory_tokens']
         segment_count = state['segment_count']
 
+        # Update rolling hidden_buffer: append current tokens, keep only latest W
+        hidden_buffer = self._cat(state['hidden_buffer'], hidden_states.detach())
+        if hidden_buffer.shape[1] > cfg.attention_pressure_window:
+            hidden_buffer = hidden_buffer[:, -cfg.attention_pressure_window:]
+
         buffer, memory_tokens, segment_count = self._try_compress(
-            buffer, memory_tokens, segment_count, hidden_states
+            buffer, memory_tokens, segment_count, hidden_states, hidden_buffer
         )
 
         memory_cache.update_layer_memory(
-            self.layer_idx, buffer, memory_tokens, segment_count
+            self.layer_idx, buffer, memory_tokens, segment_count, hidden_buffer
         )
         return memory_cache
 
@@ -604,7 +658,6 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
         past_key_values: Cache | list[torch.FloatTensor] | None = None,
         use_cache:       bool | None = False,
         output_attentions: bool | None = False,
-        memory_cache:    MemoryCache | None = None,
         **kwargs,
     ) -> tuple:
         # ── 1. Self-Attention (local window) ──────────────────────────────
@@ -621,8 +674,8 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states  # h_sa
 
         # ── 2. Memory Cross-Attention (conditional on available memory) ───
-        if self.enable_memory and memory_cache is not None:
-            state = memory_cache.get_layer_memory(self.layer_idx)
+        if self.enable_memory and isinstance(past_key_values, MemoryCache):
+            state = past_key_values.get_layer_memory(self.layer_idx)
             mem_tokens = state['memory_tokens']
             if mem_tokens is not None and mem_tokens.shape[1] > 0:
                 B, M, _ = mem_tokens.shape
@@ -638,10 +691,10 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states  # out
 
         # ── 4. Update memory buffer (after MLP for richer representations) ─
-        if self.enable_memory and memory_cache is not None:
-            memory_cache = self._update_memory(hidden_states, memory_cache)
+        if self.enable_memory and isinstance(past_key_values, MemoryCache):
+            past_key_values = self._update_memory(hidden_states, past_key_values)
 
-        return hidden_states, attentions, past_key_values, memory_cache
+        return hidden_states, attentions, past_key_values
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -708,13 +761,102 @@ class MemoryTransformerModel(MemoryTransformerPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embeddings = value
 
+    def _chunked_forward(
+        self,
+        inputs_embeds:  torch.FloatTensor,          # (B, L, C)
+        attention_mask: Optional[torch.Tensor],      # (B, L) padding mask or None
+        past_key_values: MemoryCache | None,
+        return_dict:    bool,
+        **kwargs,
+    ) -> tuple | BaseModelOutputWithPastAndMemory:
+        """
+        Training-time chunked forward pass with truncated BPTT.
+
+        The sequence is processed in chunks of `training_chunk_size`.  A single
+        MemoryCache is threaded through all chunks carrying both:
+          • KV cache (attn_state) – so tokens in chunk i+1 can attend back to
+            chunk i via the local sliding window (train/inference consistent).
+          • Memory compression state – so memory cross-attention in chunk i+1
+            retrieves compressed representations of earlier context.
+
+        After each chunk the cache is detached (truncated BPTT) to prevent
+        unbounded gradient graphs and FSDP2 storage errors.  The FLALayer
+        sliding-window logic (cache_kwargs["window_size"]) automatically keeps
+        the KV footprint bounded at raw_buffer_max_size tokens.
+
+        Two-phase structure
+        -------------------
+        Phase 1 – tokens[0 : raw_buffer_max_size]
+            Processed in a single forward pass (equivalent to normal prefill).
+            No prior KV or memory exists yet, so this is identical to the
+            non-chunked path.  Establishes the initial KV window and seeds
+            the memory compression pipeline.
+
+        Phase 2 – tokens[raw_buffer_max_size : L], in training_chunk_size slices
+            Each chunk simulates a decode step: it can attend back to Phase 1
+            tokens (and earlier Phase 2 tokens) via the sliding-window KV cache,
+            and retrieves long-range context via memory cross-attention.
+            training_chunk_size should be small (≈ 1–100 tokens) to approximate
+            single-token decoding while keeping training time tractable.
+        """
+        window_size  = self.config.raw_buffer_max_size
+        chunk_size   = self.config.training_chunk_size
+        B, L, _      = inputs_embeds.shape
+        position_ids = kwargs.get('position_ids', None)
+
+        cache         = past_key_values if past_key_values is not None else MemoryCache()
+        chunk_outputs: list[torch.Tensor] = []
+
+        # ── helpers ───────────────────────────────────────────────────────────
+        def _run_chunk(start: int, end: int) -> torch.Tensor:
+            nonlocal cache
+            h = inputs_embeds[:, start:end]
+            if attention_mask is not None and attention_mask.dim() == 2:
+                chunk_attn_mask = attention_mask[:, start:end]
+            else:
+                chunk_attn_mask = None
+            kw = dict(kwargs)
+            if position_ids is not None:
+                kw['position_ids'] = position_ids[:, start:end]
+            for layer in self.layers:
+                h, _, cache = layer(
+                    h,
+                    attention_mask=chunk_attn_mask,
+                    past_key_values=cache,
+                    use_cache=True,
+                    output_attentions=False,
+                    **kw,
+                )
+            return h
+
+        # ── Phase 1: full window in one shot ─────────────────────────────────
+        chunk_outputs.append(_run_chunk(0, window_size))
+        cache.detach_()
+
+        # ── Phase 2: decode-like chunks ───────────────────────────────────────
+        for chunk_start in range(window_size, L, chunk_size):
+            chunk_outputs.append(_run_chunk(chunk_start, min(chunk_start + chunk_size, L)))
+            cache.detach_()   # truncated BPTT; KV window already bounded by FLALayer
+
+        hidden_states = self.norm(torch.cat(chunk_outputs, dim=1))   # (B, L, C)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, None, None, None, cache] if v is not None)
+
+        return BaseModelOutputWithPastAndMemory(
+            last_hidden_state=hidden_states,
+            past_key_values=cache,
+            hidden_states=None,
+            attentions=None,
+            memory_state=cache,
+        )
+
     def forward(
         self,
         input_ids:       torch.LongTensor | None = None,
         attention_mask:  Optional[torch.Tensor]  = None,
         inputs_embeds:   torch.FloatTensor | None = None,
         past_key_values: Cache | list[torch.FloatTensor] | None = None,
-        memory_cache:    MemoryCache | None = None,
         use_cache:       bool | None = None,
         output_attentions:    bool | None = None,
         output_hidden_states: bool | None = None,
@@ -744,16 +886,39 @@ class MemoryTransformerModel(MemoryTransformerPreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # ── KV cache initialisation ───────────────────────────────────────
-        if use_cache:
+        # ── Cache initialisation ──────────────────────────────────────────────
+        if use_cache or self.config.use_memory:
             if past_key_values is not None and not isinstance(past_key_values, Cache):
                 past_key_values = Cache.from_legacy_cache(past_key_values)
             elif past_key_values is None:
-                past_key_values = Cache()
+                past_key_values = MemoryCache() if self.config.use_memory else Cache()
 
-        # ── Memory cache initialisation ───────────────────────────────────
-        if self.config.use_memory and memory_cache is None:
-            memory_cache = MemoryCache()
+        # ── Chunked training path ─────────────────────────────────────────
+        # During training with use_memory, process the sequence in fixed-size
+        # chunks so each chunk's memory_cross_attention sees compressed history
+        # from earlier chunks.  This makes memory_attn receive meaningful
+        # gradients (it now retrieves from non-empty memory slots).
+        if (
+            self.training
+            and self.config.use_memory
+            and self.config.training_chunk_size is not None
+            and kwargs.get('cu_seqlens') is None   # varlen not supported in chunked mode
+            # Only enter chunked mode when the sequence exceeds the local attention
+            # window (raw_buffer_max_size).  Shorter sequences fit in one forward pass.
+            and hidden_states.shape[1] > self.config.raw_buffer_max_size
+        ):
+            if output_hidden_states:
+                warnings.warn(
+                    '`output_hidden_states` is not supported in chunked training '
+                    'mode; setting it to False.'
+                )
+            return self._chunked_forward(
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                return_dict=return_dict,
+                **kwargs,
+            )
 
         all_hidden_states = () if output_hidden_states else None
         all_attns         = () if output_attentions    else None
@@ -762,13 +927,12 @@ class MemoryTransformerModel(MemoryTransformerPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            hidden_states, attentions, past_key_values, memory_cache = layer(
+            hidden_states, attentions, past_key_values = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                memory_cache=memory_cache,
                 **kwargs,
             )
 
@@ -784,7 +948,8 @@ class MemoryTransformerModel(MemoryTransformerPreTrainedModel):
             return tuple(
                 v for v in [
                     hidden_states, past_key_values,
-                    all_hidden_states, all_attns, memory_cache,
+                    all_hidden_states, all_attns,
+                    past_key_values if isinstance(past_key_values, MemoryCache) else None,
                 ] if v is not None
             )
 
@@ -793,7 +958,7 @@ class MemoryTransformerModel(MemoryTransformerPreTrainedModel):
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attns,
-            memory_state=memory_cache,
+            memory_state=past_key_values if isinstance(past_key_values, MemoryCache) else None,
         )
 
 
@@ -837,7 +1002,6 @@ class MemoryTransformerForCausalLM(MemoryTransformerPreTrainedModel, FLAGenerati
         attention_mask:  torch.Tensor | None = None,
         inputs_embeds:   torch.FloatTensor | None = None,
         past_key_values: Cache | list[torch.FloatTensor] | None = None,
-        memory_cache:    MemoryCache | None = None,
         labels:          torch.LongTensor | None = None,
         use_cache:       bool | None = None,
         output_attentions:    bool | None = None,
@@ -853,7 +1017,6 @@ class MemoryTransformerForCausalLM(MemoryTransformerPreTrainedModel, FLAGenerati
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
-            memory_cache=memory_cache,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

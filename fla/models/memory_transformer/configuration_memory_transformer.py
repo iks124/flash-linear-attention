@@ -44,11 +44,12 @@ class MemoryTransformerConfig(PretrainedConfig):
         use_memory (bool): Enable the memory compression mechanism.
         memory_layers (list[int] | None): Layer indices that receive memory
             augmentation. None means all layers.
-        local_window_size (int): Sliding-window size for the main self-attention
-            (KV cache is bounded to this many tokens). Set to None for full attention.
         raw_buffer_max_size (int): Maximum number of tokens allowed to accumulate
             in the raw buffer before a forced compression is triggered regardless
-            of semantic boundaries.
+            of semantic boundaries.  Also determines the self-attention window size
+            (local_window_size = raw_buffer_max_size), ensuring that uncompressed
+            tokens are always reachable via self-attention and there is no limbo
+            zone between the KV window and the compression boundary.
         boundary_threshold (float): Sigmoid-probability threshold above which a
             position is classified as a segment boundary.
         min_segment_length (int): Minimum number of tokens a segment must contain
@@ -99,8 +100,7 @@ class MemoryTransformerConfig(PretrainedConfig):
         # ── Memory mechanism ──────────────────────────────────────────────
         use_memory: bool = True,
         memory_layers: list[int] | None = None,
-        local_window_size: int | None = 512,
-        raw_buffer_max_size: int = 256,
+        raw_buffer_max_size: int = 512,
         boundary_threshold: float = 0.5,
         min_segment_length: int = 8,
         max_segment_length: int = 64,
@@ -111,6 +111,8 @@ class MemoryTransformerConfig(PretrainedConfig):
         # ── Attention-pressure compression trigger ────────────────────────
         attention_pressure_window: int = 8,
         attention_pressure_threshold: float | None = None,
+        # ── Training ──────────────────────────────────────────────────────
+        training_chunk_size: int | None = None,
         **kwargs,
     ):
         # ── Standard Transformer fields ───────────────────────────────────
@@ -138,8 +140,11 @@ class MemoryTransformerConfig(PretrainedConfig):
 
         # ── Memory fields ─────────────────────────────────────────────────
         self.use_memory = use_memory
-        self.local_window_size = local_window_size
         self.raw_buffer_max_size = raw_buffer_max_size
+        # local_window_size is derived from raw_buffer_max_size to guarantee that
+        # every uncompressed token (in raw_buffer) is always within the attention
+        # window, eliminating any limbo zone between KV cache and memory_tokens.
+        self.local_window_size = raw_buffer_max_size
         self.boundary_threshold = boundary_threshold
         self.min_segment_length = min_segment_length
         self.max_segment_length = max_segment_length
@@ -154,9 +159,11 @@ class MemoryTransformerConfig(PretrainedConfig):
         # positions receiving less than half of "uniform" attention are considered
         # low-pressure.  Falls back to 1/512 when local_window_size is None.
         if attention_pressure_threshold is None:
-            ref = local_window_size if local_window_size is not None else 512
-            attention_pressure_threshold = 1.0 / (2.0 * ref)
+            attention_pressure_threshold = 1.0 / (2.0 * raw_buffer_max_size)
         self.attention_pressure_threshold = attention_pressure_threshold
+
+        # Training
+        self.training_chunk_size = training_chunk_size
 
         # Default memory layers: every layer
         if memory_layers is None:
@@ -164,6 +171,17 @@ class MemoryTransformerConfig(PretrainedConfig):
         self.memory_layers = sorted(set(memory_layers))
 
         # ── Validation ────────────────────────────────────────────────────
+        if training_chunk_size is not None:
+            if training_chunk_size <= 0:
+                raise ValueError(
+                    f'`training_chunk_size` must be positive, got {training_chunk_size}.'
+                )
+            if training_chunk_size <= min_segment_length:
+                raise ValueError(
+                    f'`training_chunk_size` ({training_chunk_size}) must be greater than '
+                    f'`min_segment_length` ({min_segment_length}) so that at least one '
+                    f'compression cycle can occur per chunk.'
+                )
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(
                 '`fuse_cross_entropy` and `fuse_linear_cross_entropy` '
