@@ -635,14 +635,20 @@ class MemoryTransformerBlock(GradientCheckpointingLayer):
         memory_tokens = state['memory_tokens']
         segment_count = state['segment_count']
 
-        # Update rolling hidden_buffer: append current tokens, keep only latest W
-        hidden_buffer = self._cat(state['hidden_buffer'], hidden_states.detach())
-        if hidden_buffer.shape[1] > cfg.attention_pressure_window:
-            hidden_buffer = hidden_buffer[:, -cfg.attention_pressure_window:]
+        # Pass the OLD hidden_buffer (before appending current tokens) to _try_compress
+        # so that _compute_attention_pressure can correctly concatenate old history with
+        # the current hidden_states.  Updating hidden_buffer AFTER compression avoids
+        # counting the current tokens twice (once in hidden_buffer, once as hidden_states).
+        old_hidden_buffer = state['hidden_buffer']
 
         buffer, memory_tokens, segment_count = self._try_compress(
-            buffer, memory_tokens, segment_count, hidden_states, hidden_buffer
+            buffer, memory_tokens, segment_count, hidden_states, old_hidden_buffer
         )
+
+        # Now update rolling hidden_buffer: append current tokens, keep only latest W
+        hidden_buffer = self._cat(old_hidden_buffer, hidden_states.detach())
+        if hidden_buffer.shape[1] > cfg.attention_pressure_window:
+            hidden_buffer = hidden_buffer[:, -cfg.attention_pressure_window:]
 
         memory_cache.update_layer_memory(
             self.layer_idx, buffer, memory_tokens, segment_count, hidden_buffer
