@@ -18,13 +18,18 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
          Only attends to the most recent `local_window_size` tokens,
          keeping the KV cache bounded.
 
-      2. **GLAMemory** (memory layers only)
-         Runs chunk_gla on the current tokens with the previous GLA recurrent
-         state as initial_state.  Returns both the per-token read output and
-         the updated state.  Write (k/v/gk) and read (q) are trained jointly
-         in every forward pass — all projections receive direct gradients.
+      2. **GLA Memory Read** (memory layers only)
+         Reads from the accumulated GLA recurrent state (B, H, K, V) via a
+         linear attention query: o = Q @ S.  The GLA state stores compressed
+         representations of all context older than the current window.
 
       3. **MLP**
+
+    After each full block forward pass the hidden states are appended to a
+    per-layer `raw_buffer`.  When the buffer exceeds `raw_buffer_max_size`,
+    the oldest overflow tokens are compressed into the GLA state via
+    `GLAMemoryCompressor` (fused_recurrent_gla), which updates the state
+    with natural gating/forgetting.
 
     Parameters
     ----------
@@ -36,19 +41,18 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
         use_l2warp, vocab_size.
 
     Memory-specific params:
-        use_memory (bool): Enable the GLA memory mechanism.
+        use_memory (bool): Enable the memory compression mechanism.
         memory_layers (list[int] | None): Layer indices that receive memory
             augmentation. None means all layers.
-        local_window_size (int): Self-attention window size (derived from
-            raw_buffer_max_size for backward compatibility).
-        gla_num_heads (int | None): Number of heads for GLAMemory. Defaults to num_heads.
-        gla_expand_k (float): Key expansion ratio for GLAMemory.
-        gla_expand_v (float): Value expansion ratio for GLAMemory.
+        raw_buffer_max_size (int): Buffer overflow threshold. When the raw buffer
+            exceeds this many tokens, the oldest overflow is compressed into the
+            GLA state. Also determines the self-attention window size.
+        gla_num_heads (int | None): Number of heads for GLAMemoryCompressor and
+            GLAMemoryReader. Defaults to num_heads.
+        gla_expand_k (float): Key expansion ratio for GLA compressor/reader.
+        gla_expand_v (float): Value expansion ratio for GLA compressor/reader.
         gla_gate_low_rank_dim (int): Low-rank bottleneck for the GLA gate projection.
         gla_gate_logit_normalizer (int): Divisor applied after logsigmoid on gate logits.
-        training_chunk_size (int | None): Chunk size for truncated BPTT. When set,
-            sequences longer than this are processed chunk-by-chunk with
-            gla_state detached between chunks.
     """
 
     model_type = 'simple_memory_transformer'
@@ -92,7 +96,7 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
         gla_expand_v: float = 1.0,
         gla_gate_low_rank_dim: int = 16,
         gla_gate_logit_normalizer: int = 16,
-        # Kernel mode for GLAMemory.
+        # Kernel mode for GLAMemoryCompressor.
         # 'auto' (default): fused_recurrent for T<=64 (decode), chunk for T>64 (train/prefill).
         # 'chunk': always use chunk_gla (chunk-parallel, gradient-compatible).
         # 'fused_recurrent': always use fused_recurrent_gla (serial, minimal overhead).
