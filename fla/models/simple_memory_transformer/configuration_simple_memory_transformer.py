@@ -7,29 +7,32 @@ from transformers.configuration_utils import PretrainedConfig
 
 class SimpleMemoryTransformerConfig(PretrainedConfig):
     """
-    Configuration for SimpleMemoryTransformer: a Transformer augmented with
-    GLA-based online compression memory.
+    Configuration for SimpleMemoryTransformer: a Transformer with async-eviction
+    GLA-based long-range memory.
 
     Architecture overview
     ---------------------
-    Each SimpleMemoryTransformerBlock contains three pre-norm sublayers:
+    Each SimpleMemoryTransformerBlock contains three pre-norm sublayers plus an
+    async write step:
 
       1. **Local Self-Attention** (window_size = local_window_size)
          Only attends to the most recent `local_window_size` tokens,
          keeping the KV cache bounded.
 
-      2. **GLA Memory Read** (memory layers only)
-         Reads from the accumulated GLA recurrent state (B, H, K, V) via a
-         linear attention query: o = Q @ S.  The GLA state stores compressed
-         representations of all context older than the current window.
+      2. **Async-eviction GLA Memory** (memory layers only)
+         GLAMemoryReader reads from the PREVIOUS chunk's write_buffer — tokens
+         that have just been evicted from the SA window.  No overlap with SA.
+         GLAMemoryCompressor writes current tokens into a new write_buffer for
+         the NEXT chunk's reader.
 
       3. **MLP**
 
-    After each full block forward pass the hidden states are appended to a
-    per-layer `raw_buffer`.  When the buffer exceeds `raw_buffer_max_size`,
-    the oldest overflow tokens are compressed into the GLA state via
-    `GLAMemoryCompressor` (fused_recurrent_gla), which updates the state
-    with natural gating/forgetting.
+    Gradient flow
+    -------------
+    write_buffer stays live across chunk boundaries so that:
+        loss_{N+1} → reader → write_buffer_N (live) → compressor.{k,v,gk}_proj
+    All projections receive gradients every chunk; compressor.initial_state is
+    detached to prevent gradient chains beyond one chunk boundary.
 
     Parameters
     ----------
@@ -41,16 +44,15 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
         use_l2warp, vocab_size.
 
     Memory-specific params:
-        use_memory (bool): Enable the memory compression mechanism.
+        use_memory (bool): Enable the GLA async-eviction memory.
         memory_layers (list[int] | None): Layer indices that receive memory
             augmentation. None means all layers.
-        raw_buffer_max_size (int): Buffer overflow threshold. When the raw buffer
-            exceeds this many tokens, the oldest overflow is compressed into the
-            GLA state. Also determines the self-attention window size.
-        gla_num_heads (int | None): Number of heads for GLAMemoryCompressor and
-            GLAMemoryReader. Defaults to num_heads.
-        gla_expand_k (float): Key expansion ratio for GLA compressor/reader.
-        gla_expand_v (float): Value expansion ratio for GLA compressor/reader.
+        raw_buffer_max_size (int): Determines the SA window size (local_window_size).
+            Kept for backward compatibility; no raw buffer exists in this design.
+        gla_num_heads (int | None): Number of heads for compressor and reader.
+            Defaults to num_heads.
+        gla_expand_k (float): Key expansion ratio for compressor/reader.
+        gla_expand_v (float): Value expansion ratio for compressor/reader.
         gla_gate_low_rank_dim (int): Low-rank bottleneck for the GLA gate projection.
         gla_gate_logit_normalizer (int): Divisor applied after logsigmoid on gate logits.
     """

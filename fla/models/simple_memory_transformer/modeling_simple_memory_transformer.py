@@ -1,41 +1,45 @@
 """
-SimpleMemoryTransformer: Transformer with GLA-based online compression memory.
+SimpleMemoryTransformer: Transformer with GLA-based async-eviction memory.
 
 Design overview
 ───────────────
-Each block has three pre-norm sublayers.  The INPUT hidden states are stored
-into the buffer BEFORE compression runs, so the oldest overflow tokens are
-always from prior steps — never the current input.  This ensures:
-  • Causality: current tokens never appear in the gla_state they query.
-  • Train/inference consistency: both use the same chunked path for long inputs.
-  • Compressor trainability: gla_state is live (in-graph) when the reader uses it.
+Each block has three pre-norm sublayers plus an async write step:
 
-    _append_to_buffer(x)    # store detached input FIRST
-    _compress_overflow()    # compress oldest overflow → live gla_state (in-graph)
     residual = x
-    h_sa  = residual + Self-Attention(attn_norm(residual))   # local window
-    h_mem = h_sa + MemoryRead(h_sa, gla_state)               # read live gla_state
-    out   = h_mem + MLP(mlp_norm(h_mem))
+    h_sa     = residual + Self-Attention(attn_norm(residual))   # local window
+    h_mem    = h_sa + Reader(h_sa, prev_write_buffer)           # read evicted tokens
+    out      = h_mem + MLP(mlp_norm(h_mem))
+    new_wb   = Compressor(h_sa, initial=prev_wb.detach())       # write for next chunk
 
-Compression pipeline
-────────────────────
-After each forward call, `out.detach()` is appended to the per-layer `raw_buffer`.
-When the buffer exceeds `raw_buffer_max_size`, the oldest overflow tokens are
-compressed into the persistent GLA recurrent state via `GLAMemoryCompressor`.
-Compression is purely overflow-driven: triggered only when the buffer grows
-beyond `raw_buffer_max_size`.
+Two-level memory hierarchy
+──────────────────────────
+  L1 (precise):    KV cache — local SA window covers recent tokens exactly.
+  L2 (compressed): GLA state — GLAMemoryReader retrieves from tokens evicted one chunk ago.
 
-Memory storage: GLA recurrent state (B, H, K, V)
-──────────────────────────────────────────────────
-`GLAMemoryCompressor` runs `fused_recurrent_gla` on the overflow segment, using
-the previous state as `initial_state`. This accumulates compressed representations
-with natural gating/forgetting (older content decays as new content is absorbed).
+No overlap: prev_write_buffer contains tokens from chunk N-1, which are outside the SA
+window when chunk N processes.  SA and GLA cover disjoint token sets.
 
-Memory retrieval: linear attention read
-────────────────────────────────────────
-`GLAMemoryReader` projects current hidden states to queries Q, then retrieves:
-    o_t = Q_t @ S          (B, T, H, K) × (B, H, K, V) → (B, T, H, V)
-Per-head RMSNorm + sigmoid gate + output projection complete the retrieval.
+Joint optimization via one-chunk delay
+───────────────────────────────────────
+prev_write_buffer is NOT detached between chunks.  It stays live so that:
+
+    loss_{N+1} → reader → prev_write_buffer_N (live) → compressor.{k,v,gk}_proj  ✓
+
+All projections (q_proj in reader, k/v/gk_proj in compressor) receive direct gradients
+every chunk.  The compressor is evaluated on "was what you stored useful for the next
+window's queries?" — semantically the correct signal for long-range memory.
+
+initial_state is prev_write_buffer.detach(), truncating the gradient chain at the write
+boundary so gradients do not span more than one chunk.
+
+Training via truncated BPTT
+────────────────────────────
+cache.detach_() after each chunk detaches attn_state (KV cache) but intentionally
+leaves write_buffer live.  write_buffer is lazily detached when consumed as initial_state
+by the compressor in the next chunk's forward.
+
+Note: two consecutive chunks share a gradient graph through write_buffer.  FSDP2 users
+should ensure parameter shards remain available across consecutive chunk boundaries.
 """
 
 from __future__ import annotations
@@ -93,73 +97,76 @@ class CausalLMOutputWithPastAndMemory(CausalLMOutputWithPast):
 
 class MemoryCache(Cache):
     """
-    Extends the standard KV Cache with per-layer GLA compression state.
+    Extends the standard KV Cache with per-layer GLA write buffers.
 
     Per-layer fields
     ----------------
-    raw_buffer  : (B, L_buf, C)         – detached hidden states not yet compressed.
-    gla_state   : (B, H, K, V) | None  – accumulated GLA recurrent state (the memory).
+    write_buffer : (B, H, K, V) | None
+        Live GLA state produced by the current chunk's GLAMemoryCompressor.
+        Intentionally NOT detached between chunks — kept live so the next
+        chunk's GLAMemoryReader can propagate gradients through it:
+
+            loss_{N+1} → reader → write_buffer_N (live) → compressor.{k,v,gk}_proj ✓
+
+        Lazily detached in GLAMemoryCompressor.forward() when it becomes the
+        initial_state for the next write, truncating the gradient chain at one chunk.
     """
 
     def __init__(self, seen_tokens: int = 0, **kwargs: Any) -> None:
         super().__init__(seen_tokens=seen_tokens, **kwargs)
-        self._raw_buffer: dict[int, torch.Tensor | None] = {}
-        self._gla_state:  dict[int, torch.Tensor | None] = {}
+        self._write_buffer: dict[int, torch.Tensor | None] = {}
 
     def _ensure_layer(self, layer_idx: int) -> None:
-        if layer_idx not in self._raw_buffer:
-            self._raw_buffer[layer_idx] = None
-            self._gla_state[layer_idx]  = None
+        if layer_idx not in self._write_buffer:
+            self._write_buffer[layer_idx] = None
 
-    def get_layer_memory(self, layer_idx: int) -> dict[str, Any]:
+    def get_write_buffer(self, layer_idx: int) -> torch.Tensor | None:
         self._ensure_layer(layer_idx)
-        return {
-            'raw_buffer': self._raw_buffer[layer_idx],
-            'gla_state':  self._gla_state[layer_idx],
-        }
+        return self._write_buffer[layer_idx]
 
-    def update_layer_memory(
-        self,
-        layer_idx:  int,
-        raw_buffer: torch.Tensor | None,
-        gla_state:  torch.Tensor | None,
-    ) -> None:
+    def set_write_buffer(self, layer_idx: int, state: torch.Tensor | None) -> None:
         self._ensure_layer(layer_idx)
-        self._raw_buffer[layer_idx] = raw_buffer
-        self._gla_state[layer_idx]  = gla_state
+        self._write_buffer[layer_idx] = state
 
     def detach_(self) -> 'MemoryCache':
         """
-        Detach all stored tensors in-place (truncated BPTT).
+        Detach KV cache (attn_state) in-place for truncated BPTT / FSDP2.
 
-        Detaches both the KV cache (attn_state in each FLALayer) and the memory
-        compression state (gla_state, raw_buffer).  Call this after each training
-        chunk to break cross-chunk gradient chains.
+        write_buffer is intentionally NOT detached here — it must stay live so
+        that the next chunk's reader can propagate gradients back to the
+        compressor.  The lazy detach happens in GLAMemoryCompressor.forward()
+        when write_buffer is passed as initial_state for the next write.
         """
         for layer in self.layers:
             if layer.state is not None and layer.state.get('attn_state') is not None:
                 layer.state['attn_state'] = tuple(t.detach() for t in layer.state['attn_state'])
-        for d in (self._raw_buffer, self._gla_state):
-            for k, t in d.items():
-                if t is not None:
-                    d[k] = t.detach()
+        # write_buffer: NOT detached — kept live for next chunk's reader.
         return self
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# GLA Memory Compressor
+# GLAMemoryCompressor  (write-only, no q_proj)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class GLAMemoryCompressor(nn.Module):
     """
-    Compresses a variable-length segment into a GLA recurrent state.
+    Write-only GLA compressor: accumulates current tokens into a recurrent state.
 
-    Runs fused_recurrent_gla on the segment, continuing from `initial_state`
-    if provided.  The GLA gating mechanism acts as a natural forgetting decay:
-    older content is progressively weighted out as new segments arrive.
+    Only k/v/gk projections are present — no q_proj.  The GLA state update
 
-    Returns the updated recurrent state (B, H, K, V) which serves as the
-    entire compressed memory — no explicit slot cap is needed.
+        S_t = diag(exp(gk_t)) ⊙ S_{t-1} + k_t^T v_t
+
+    does not involve q, so q_proj would carry zero gradient and is omitted.
+
+    The per-token read output of the GLA kernel is discarded; only new_state
+    is returned and stored in the cache for the next chunk's reader.
+
+    Gradient flow (one-chunk-delayed, via async write pattern):
+        loss_{N+1} → GLAMemoryReader → write_buffer_N (live)
+                   → ∂write_buffer_N / ∂{k,v,gk}_proj  ✓
+
+    initial_state is always passed in as detached to prevent gradient chains
+    from extending beyond one chunk boundary.
     """
 
     def __init__(
@@ -175,22 +182,21 @@ class GLAMemoryCompressor(nn.Module):
     ):
         super().__init__()
         assert mode in ('auto', 'chunk', 'fused_recurrent'), \
-            f"Unsupported mode `{mode}`. Choose from 'auto', 'chunk', 'fused_recurrent'."
-        self.mode                 = mode
-        self.num_heads            = num_heads
-        self.key_dim              = int(hidden_size * expand_k)
-        self.value_dim            = int(hidden_size * expand_v)
-        self.head_k_dim           = self.key_dim  // num_heads
-        self.head_v_dim           = self.value_dim // num_heads
+            f"mode must be 'auto', 'chunk', or 'fused_recurrent', got '{mode}'"
+        self.mode                  = mode
+        self.num_heads             = num_heads
+        self.key_dim               = int(hidden_size * expand_k)
+        self.value_dim             = int(hidden_size * expand_v)
+        self.head_k_dim            = self.key_dim   // num_heads
+        self.head_v_dim            = self.value_dim // num_heads
         self.gate_logit_normalizer = gate_logit_normalizer
 
         assert self.key_dim   % num_heads == 0, "key_dim must be divisible by num_heads"
         assert self.value_dim % num_heads == 0, "value_dim must be divisible by num_heads"
 
-        self.norm   = nn.RMSNorm(hidden_size, eps=norm_eps)
-        self.q_proj = nn.Linear(hidden_size, self.key_dim,   bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.key_dim,   bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
+        self.norm    = nn.RMSNorm(hidden_size, eps=norm_eps)
+        self.k_proj  = nn.Linear(hidden_size, self.key_dim,   bias=False)
+        self.v_proj  = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.gk_proj = nn.Sequential(
             nn.Linear(hidden_size, gate_low_rank_dim, bias=False),
             nn.Linear(gate_low_rank_dim, self.key_dim, bias=True),
@@ -198,44 +204,35 @@ class GLAMemoryCompressor(nn.Module):
 
     def forward(
         self,
-        segment:       torch.Tensor,              # (B, T, C)
-        initial_state: torch.Tensor | None = None, # (B, H, K, V)
-    ) -> torch.Tensor:                             # new state (B, H, K, V)
-        x  = self.norm(segment)
-        q  = self.q_proj(x)   # (B, T, key_dim)
-        k  = self.k_proj(x)
-        v  = self.v_proj(x)   # (B, T, value_dim)
-        gk = self.gk_proj(x)  # (B, T, key_dim)
-
-        q  = rearrange(q,  'b t (h d) -> b t h d', d=self.head_k_dim)
-        k  = rearrange(k,  'b t (h d) -> b t h d', d=self.head_k_dim)
-        v  = rearrange(v,  'b t (h d) -> b t h d', d=self.head_v_dim)
-        gk = rearrange(gk, 'b t (h d) -> b t h d', d=self.head_k_dim)
+        hidden_states: torch.Tensor,              # (B, T, C)
+        state:         torch.Tensor | None = None, # (B, H, K, V) — must be detached
+    ) -> torch.Tensor:                             # new_state (B, H, K, V)
+        x  = self.norm(hidden_states)
+        k  = rearrange(self.k_proj(x),  'b t (h d) -> b t h d', d=self.head_k_dim)
+        v  = rearrange(self.v_proj(x),  'b t (h d) -> b t h d', d=self.head_v_dim)
+        gk = rearrange(self.gk_proj(x), 'b t (h d) -> b t h d', d=self.head_k_dim)
         gk = F.logsigmoid(gk) / self.gate_logit_normalizer
 
-        # Auto-selection (mirrors GatedLinearAttention's runtime override):
-        #   T <= 64 : fused_recurrent — decode (compress_to=1) or very short segment.
-        #             Purely sequential kernel, zero chunk-parallelism overhead.
-        #   T >  64 : chunk — training or long-prompt prefill.
-        #             Chunk-parallel, supports initial_state, gradient-compatible.
-        # When mode is explicitly set ('chunk' or 'fused_recurrent'), the T<=64
-        # guard still forces fused_recurrent to avoid degenerate chunk launches.
-        T = segment.shape[1]
-        if T <= 64 or self.mode == 'fused_recurrent':
-            mode = 'fused_recurrent'
-        else:
-            mode = 'chunk'  # self.mode == 'auto' or 'chunk'
+        # Dummy zero query: the GLA kernel API requires q, but the state update
+        # S_t = g_t ⊙ S_{t-1} + k_t^T v_t does not involve q.  The per-token
+        # output (o_t = q_t @ S_t) is discarded — only new_state is kept.
+        q = torch.zeros(
+            hidden_states.shape[0], hidden_states.shape[1],
+            self.num_heads, self.head_k_dim,
+            dtype=k.dtype, device=k.device,
+        )
 
-        if mode == 'fused_recurrent':
+        T = hidden_states.shape[1]
+        if T <= 64 or self.mode == 'fused_recurrent':
             _, new_state = fused_recurrent_gla(
                 q=q, k=k, v=v, gk=gk,
-                initial_state=initial_state,
+                initial_state=state,
                 output_final_state=True,
             )
-        else:  # chunk
+        else:
             _, new_state = chunk_gla(
                 q=q, k=k, v=v, g=gk,
-                initial_state=initial_state,
+                initial_state=state,
                 output_final_state=True,
             )
 
@@ -243,19 +240,22 @@ class GLAMemoryCompressor(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# GLA Memory Reader
+# GLAMemoryReader
 # ──────────────────────────────────────────────────────────────────────────────
 
 class GLAMemoryReader(nn.Module):
     """
-    Reads from a GLA recurrent state (B, H, K, V) given current hidden states.
+    Read-only GLA reader: retrieves from a recurrent state via linear attention.
 
-    Projects hidden_states → queries Q, then performs a linear attention read:
-        o = Q @ S    (B, T, H, K) × (B, H, K, V) → (B, T, H, V)
+    Projects hidden_states → Q, then:
+        o = Q @ state    (B, T, H, K) × (B, H, K, V) → (B, T, H, V)
 
     Queries are L2-normalised for stable retrieval from an accumulated state.
-    Per-head RMSNorm + sigmoid gate + output projection map the result back to
-    the model's hidden_size.
+    Per-head RMSNorm + sigmoid gate + output projection map back to hidden_size.
+
+    Gradient flow:
+        loss → mem_out → {q_proj, o_proj, gate_proj, v_norm, norm}   ✓  (direct)
+        loss → mem_out → state (live write_buffer) → compressor.{k,v,gk}_proj  ✓
     """
 
     def __init__(
@@ -270,7 +270,7 @@ class GLAMemoryReader(nn.Module):
         self.num_heads  = num_heads
         self.key_dim    = int(hidden_size * expand_k)
         self.value_dim  = int(hidden_size * expand_v)
-        self.head_k_dim = self.key_dim  // num_heads
+        self.head_k_dim = self.key_dim   // num_heads
         self.head_v_dim = self.value_dim // num_heads
 
         assert self.key_dim   % num_heads == 0
@@ -278,26 +278,24 @@ class GLAMemoryReader(nn.Module):
 
         self.norm      = nn.RMSNorm(hidden_size, eps=norm_eps)
         self.q_proj    = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.v_norm    = nn.RMSNorm(self.head_v_dim, eps=norm_eps)  # per-head output norm
+        self.v_norm    = nn.RMSNorm(self.head_v_dim, eps=norm_eps)
         self.o_proj    = nn.Linear(self.value_dim, hidden_size, bias=False)
-        self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.gate_proj = nn.Linear(hidden_size, hidden_size,   bias=False)
 
     def forward(
         self,
-        hidden_states:   torch.Tensor,  # (B, T, C)
-        recurrent_state: torch.Tensor,  # (B, H, K, V)
-    ) -> torch.Tensor:                  # (B, T, C)
+        hidden_states: torch.Tensor,  # (B, T, C)
+        state:         torch.Tensor,  # (B, H, K, V) — live write_buffer from prev chunk
+    ) -> torch.Tensor:                # (B, T, C)
         x = self.norm(hidden_states)
 
-        q = self.q_proj(x)                                                        # (B, T, key_dim)
-        q = rearrange(q, 'b t (h d) -> b t h d', d=self.head_k_dim)              # (B, T, H, K)
-        q = F.normalize(q, dim=-1)                                                # L2-norm for stability
+        q = rearrange(self.q_proj(x), 'b t (h d) -> b t h d', d=self.head_k_dim)
+        q = F.normalize(q, dim=-1)                                    # L2-norm for stability
 
-        # Linear retrieval: (B, T, H, K) × (B, H, K, V) → (B, T, H, V)
-        o = torch.einsum('bthk,bhkv->bthv', q, recurrent_state)
-        o = self.v_norm(o)                                                        # (B, T, H, V)
-        o = rearrange(o, 'b t h v -> b t (h v)')                                 # (B, T, value_dim)
-        o = self.o_proj(o)                                                        # (B, T, C)
+        o = torch.einsum('bthk,bhkv->bthv', q, state.to(q.dtype))    # (B, T, H, V)
+        o = self.v_norm(o)
+        o = rearrange(o, 'b t h v -> b t (h v)')                     # (B, T, value_dim)
+        o = self.o_proj(o)                                            # (B, T, C)
 
         gate = torch.sigmoid(self.gate_proj(x))
         return gate * o
@@ -309,26 +307,27 @@ class GLAMemoryReader(nn.Module):
 
 class SimpleMemoryTransformerBlock(GradientCheckpointingLayer):
     """
-    Transformer block with GLA-based online compression memory.
+    Transformer block with async-eviction GLA memory.
 
     Forward pass (memory-enabled layer):
 
-        _append_to_buffer(x)    # store detached INPUT first
-        _compress_overflow()    # compress oldest overflow → live gla_state (in-graph)
-        residual = x
-        h_sa  = residual + Self-Attention(attn_norm(residual))   # local window
-        h_mem = h_sa + MemoryRead(h_sa, gla_state)               # read live gla_state
-        out   = h_mem + MLP(mlp_norm(h_mem))
+        h_sa   = x + Self-Attention(attn_norm(x))              # local window
+        h_mem  = h_sa + Reader(h_sa, prev_write_buffer)        # read evicted tokens
+        out    = h_mem + MLP(mlp_norm(h_mem))
+        new_wb = Compressor(h_sa, initial=prev_wb.detach())    # write for next chunk
 
-    Key invariant: the tokens compressed into gla_state are ALWAYS from prior steps
-    (oldest overflow), never from the current input.  This guarantees causality —
-    current tokens can never query a state that contains themselves.
+    Two-level memory:
+      - SA covers the current window precisely (recent tokens).
+      - Reader reads prev_write_buffer, built from the PREVIOUS chunk's tokens,
+        which are now outside the SA window.  No overlap, no redundancy.
 
-    Gradient flow: gla_state is live (in-graph) when GLAMemoryReader consumes it,
-    so the compressor receives gradients via:
-        loss → reader → gla_state_live → compressor params
+    Gradient path for the compressor (one-chunk delay):
+        loss_{N+1} → reader → prev_write_buffer_N (live) → compressor.{k,v,gk}_proj
 
-    For layers without memory the MemoryRead step is skipped.
+    prev_write_buffer is passed as detached initial_state to the compressor,
+    truncating gradient chains at chunk boundaries without losing the read-side gradient.
+
+    For layers without memory the Reader/Compressor steps are skipped.
     """
 
     def __init__(self, config: SimpleMemoryTransformerConfig, layer_idx: int):
@@ -348,7 +347,7 @@ class SimpleMemoryTransformerBlock(GradientCheckpointingLayer):
             num_kv_heads=config.num_kv_heads,
             qkv_bias=config.qkv_bias,
             qk_norm=config.qk_norm,
-            window_size=config.local_window_size,   # bounded local window
+            window_size=config.local_window_size,
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
@@ -376,7 +375,7 @@ class SimpleMemoryTransformerBlock(GradientCheckpointingLayer):
                 norm_eps=config.norm_eps,
                 mode=config.gla_mode,
             )
-            self.memory_reader = GLAMemoryReader(
+            self.reader = GLAMemoryReader(
                 hidden_size=config.hidden_size,
                 num_heads=config.gla_num_heads,
                 expand_k=config.gla_expand_k,
@@ -384,117 +383,15 @@ class SimpleMemoryTransformerBlock(GradientCheckpointingLayer):
                 norm_eps=config.norm_eps,
             )
 
-    # ── Buffer utilities ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _cat(old: torch.Tensor | None, new: torch.Tensor) -> torch.Tensor:
-        """Concatenate along the sequence dimension."""
-        return new if old is None else torch.cat([old, new], dim=1)
-
-    def _find_compress_boundary(self, buffer: torch.Tensor) -> int | None:
-        """
-        Overflow-driven compression boundary.
-
-        Returns the number of oldest tokens to compress (exclusive end index),
-        or None if the buffer has not yet exceeded `raw_buffer_max_size`.
-
-        The buffer is allowed to grow up to `raw_buffer_max_size` tokens.
-        Once exceeded, all tokens older than the window are compressed at once,
-        leaving exactly `raw_buffer_max_size` tokens in the raw buffer.
-        """
-        L_buf = buffer.shape[1]
-        if L_buf <= self.config.raw_buffer_max_size:
-            return None
-        return L_buf - self.config.raw_buffer_max_size
-
-    def _compress_one_segment(
-        self,
-        buffer:    torch.Tensor,              # (B, L_buf, C)
-        gla_state: torch.Tensor | None,       # (B, H, K, V) or None
-        compress_to: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run GLAMemoryCompressor on `buffer[:, :compress_to]` and return
-        (remaining_buffer, updated_gla_state).
-        """
-        segment   = buffer[:, :compress_to]   # (B, compress_to, C)
-        remaining = buffer[:, compress_to:]   # (B, L_buf - compress_to, C)
-        new_state = self.compressor(segment, initial_state=gla_state)
-        return remaining, new_state
-
-    def _try_compress(
-        self,
-        buffer:    torch.Tensor,
-        gla_state: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Compress any buffer overflow into the GLA state.
-        Single-pass: after one compression the buffer is at most raw_buffer_max_size.
-        """
-        compress_to = self._find_compress_boundary(buffer)
-        if compress_to is None:
-            return buffer, gla_state
-        return self._compress_one_segment(buffer, gla_state, compress_to)
-
-    def _compress_overflow(self, memory_cache: MemoryCache) -> MemoryCache:
-        """
-        Called at the START of forward: compress any buffer overflow into a live
-        GLA state (in the current backward graph).
-
-        Because compression runs before the memory read, the freshly-produced
-        gla_state is consumed by GLAMemoryReader in the same forward/backward
-        pass, giving compressor parameters a gradient via:
-            loss → reader → gla_state_live → compressor params
-        """
-        state = memory_cache.get_layer_memory(self.layer_idx)
-        buffer = state['raw_buffer']
-        if buffer is None:
-            return memory_cache
-        compress_to = self._find_compress_boundary(buffer)
-        if compress_to is None:
-            return memory_cache
-        remaining, new_gla_state = self._compress_one_segment(
-            buffer, state['gla_state'], compress_to
-        )
-        memory_cache.update_layer_memory(self.layer_idx, remaining, new_gla_state)
-        return memory_cache
-
-    def _append_to_buffer(
-        self,
-        hidden_states: torch.Tensor,  # post-MLP output (detached before storing)
-        memory_cache:  MemoryCache,
-    ) -> MemoryCache:
-        """
-        Called at the END of forward: append detached hidden_states to the raw
-        buffer.  Compression is intentionally deferred to the next forward call
-        (_compress_overflow) so it runs inside that call's backward graph.
-        """
-        state  = memory_cache.get_layer_memory(self.layer_idx)
-        buffer = self._cat(state['raw_buffer'], hidden_states.detach())
-        memory_cache.update_layer_memory(self.layer_idx, buffer, state['gla_state'])
-        return memory_cache
-
-    # ── Forward ───────────────────────────────────────────────────────────────
-
     def forward(
         self,
-        hidden_states:  torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        hidden_states:   torch.Tensor,
+        attention_mask:  torch.Tensor | None = None,
         past_key_values: Cache | list[torch.FloatTensor] | None = None,
         use_cache:       bool | None = False,
         output_attentions: bool | None = False,
         **kwargs,
     ) -> tuple:
-        # ── 0. Append INPUT to buffer, then compress oldest overflow ───────
-        # Input is stored BEFORE compression so that compressed tokens are
-        # always from prior steps (oldest overflow), never the current input.
-        # This preserves causality: no token ever queries a gla_state that
-        # contains itself.  The live gla_state produced here is then consumed
-        # by the reader below, giving compressor params a gradient via:
-        #     loss → reader → gla_state_live → compressor params
-        if self.enable_memory and isinstance(past_key_values, MemoryCache):
-            past_key_values = self._append_to_buffer(hidden_states, past_key_values)
-            past_key_values = self._compress_overflow(past_key_values)
 
         # ── 1. Self-Attention (local window) ──────────────────────────────
         residual      = hidden_states
@@ -507,23 +404,45 @@ class SimpleMemoryTransformerBlock(GradientCheckpointingLayer):
             output_attentions=output_attentions,
             **kwargs,
         )
-        hidden_states = residual + hidden_states  # h_sa
+        h_sa          = residual + hidden_states  # local-context representation
+        hidden_states = h_sa
 
-        # ── 2. Memory Read (from the live gla_state produced in step 0) ───
+        # ── 2. Memory Read (from PREVIOUS chunk's write_buffer, kept live) ─
+        # prev_write_buffer was produced by the last chunk and is intentionally
+        # not yet detached.  Reading from it while live creates the gradient path:
+        #   loss_{N+1} → reader → prev_write_buffer_N (live) → compressor.{k,v,gk}
+        # Signal: "was what the compressor stored useful for this window's queries?"
         if self.enable_memory and isinstance(past_key_values, MemoryCache):
-            state     = past_key_values.get_layer_memory(self.layer_idx)
-            gla_state = state['gla_state']
-            if gla_state is not None:
-                mem_delta     = self.memory_reader(hidden_states, gla_state)
-                hidden_states = hidden_states + mem_delta  # h_mem
+            prev_wb = past_key_values.get_write_buffer(self.layer_idx)
+            if prev_wb is not None:
+                mem_out       = self.reader(h_sa, prev_wb)
+                hidden_states = h_sa + mem_out  # h_mem
 
         # ── 3. MLP ────────────────────────────────────────────────────────
         residual      = hidden_states
         hidden_states = self.mlp_norm(hidden_states)
         hidden_states = self.mlp(hidden_states, **kwargs)
-        hidden_states = residual + hidden_states  # out
+        out           = residual + hidden_states
 
-        return hidden_states, attentions, past_key_values
+        # ── 4. Write current tokens into new write_buffer ─────────────────
+        # h_sa is used as compressor input (same distribution as reader's q).
+        #
+        # prev_wb.detach() as initial_state: lazy truncation of the gradient
+        # chain at the write boundary.  The live reference read in step 2 above
+        # is unaffected — only the accumulated-state path (through initial_state)
+        # is disconnected, preventing cross-chunk gradient chains beyond one step.
+        #
+        # In eval mode, new_wb is immediately detached to prevent unbounded
+        # autograd graph growth across decode steps.
+        if self.enable_memory and isinstance(past_key_values, MemoryCache):
+            prev_wb = past_key_values.get_write_buffer(self.layer_idx)
+            initial = prev_wb.detach() if prev_wb is not None else None
+            new_wb  = self.compressor(h_sa, state=initial)
+            if not self.training:
+                new_wb = new_wb.detach()
+            past_key_values.set_write_buffer(self.layer_idx, new_wb)
+
+        return out, attentions, past_key_values
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -592,34 +511,34 @@ class SimpleMemoryTransformerModel(SimpleMemoryTransformerPreTrainedModel):
 
     def _chunked_forward(
         self,
-        inputs_embeds:  torch.FloatTensor,          # (B, L, C)
-        attention_mask: Optional[torch.Tensor],      # (B, L) padding mask or None
+        inputs_embeds:   torch.FloatTensor,
+        attention_mask:  Optional[torch.Tensor],
         past_key_values: MemoryCache | None,
-        return_dict:    bool,
+        return_dict:     bool,
         **kwargs,
     ) -> tuple | BaseModelOutputWithPastAndMemory:
         """
-        Chunked forward pass used for both training and long-context inference.
+        Chunked forward pass for training and long-context inference.
 
-        The sequence is split into chunks of `training_chunk_size` tokens.  A
-        single MemoryCache threads through all chunks, carrying:
-          • KV cache (attn_state) – local sliding-window attention across chunks.
-          • raw_buffer + gla_state – GLA memory compression pipeline.
+        Splits the sequence into chunks of `training_chunk_size` tokens.
+        A single MemoryCache threads through all chunks carrying:
+          • attn_state    — local SA KV cache (sliding window across chunks).
+          • write_buffer  — live GLA state from the previous chunk's compressor.
 
-        Each chunk's block.forward (new store-first design):
-          0. _append_to_buffer(input): store current chunk's input (detached).
-          1. _compress_overflow(): oldest overflow → LIVE gla_state (in-graph).
-          2. Self-attention.
-          3. Memory read from the live gla_state → compressor params get gradient.
-          4. MLP.
+        Per-chunk block forward:
+          1. SA on current tokens (local window).
+          2. Read from prev_write_buffer (live) → gradient reaches compressor.k/v/gk.
+          3. MLP.
+          4. Compressor writes current tokens → new_write_buffer (live for next chunk).
+             initial_state = prev_write_buffer.detach() (lazy truncation).
 
-        Training: cache.detach_() after each chunk for truncated BPTT and FSDP2
-          compatibility.  gla_state becomes initial_state for the next chunk's
-          compression; compressor params still receive gradient in every chunk
-          because compression recomputes a fresh live gla_state from live params.
+        cache.detach_() after each chunk:
+          • Detaches attn_state for FSDP2 / truncated BPTT.
+          • Does NOT detach write_buffer — kept live for the next chunk's reader.
+          • write_buffer is lazily detached when consumed as initial_state (step 4).
 
-        Inference: no detach — gla_state chains naturally across chunks, giving
-          the model full long-context memory without gradient overhead.
+        Inference: new_write_buffer is immediately detached in block forward
+        (non-training mode) to avoid unbounded autograd graph growth.
         """
         chunk_size   = self.config.training_chunk_size
         B, L, _      = inputs_embeds.shape
@@ -653,16 +572,11 @@ class SimpleMemoryTransformerModel(SimpleMemoryTransformerPreTrainedModel):
 
             chunk_outputs.append(h)
             if self.training:
-                # Truncated BPTT: detach cache between chunks.
-                # raw_buffer tokens are already detached (_append_to_buffer).
-                # Detaching gla_state truncates the gradient graph at this boundary;
-                # the next chunk's _compress_overflow recomputes a fresh live
-                # gla_state from (detached initial_state, detached buffer, live
-                # compressor params), so compressor params get gradient every chunk.
-                # Required for FSDP2: frees parameter shard storage after backward.
+                # Detach attn_state for FSDP2 / truncated BPTT.
+                # write_buffer is intentionally NOT detached here — see MemoryCache.detach_().
                 cache.detach_()
 
-        hidden_states = self.norm(torch.cat(chunk_outputs, dim=1))   # (B, L, C)
+        hidden_states = self.norm(torch.cat(chunk_outputs, dim=1))
 
         if not return_dict:
             return tuple(v for v in [hidden_states, None, None, None, cache] if v is not None)
@@ -717,15 +631,12 @@ class SimpleMemoryTransformerModel(SimpleMemoryTransformerPreTrainedModel):
             elif past_key_values is None:
                 past_key_values = MemoryCache() if self.config.use_memory else Cache()
 
-        # ── Chunked forward (training + long-context inference) ──────────
-        # Triggered whenever input exceeds the local window and chunking is
-        # configured.  Applies to both training and inference so that prefill
-        # of long prompts uses the same memory-read pathway as training.
+        # ── Chunked forward (training + long-context inference) ───────────────
         if (
             self.config.use_memory
             and self.config.training_chunk_size is not None
-            and kwargs.get('cu_seqlens') is None   # varlen not supported in chunked mode
-            and hidden_states.shape[1] > self.config.raw_buffer_max_size
+            and kwargs.get('cu_seqlens') is None
+            and hidden_states.shape[1] > self.config.training_chunk_size
         ):
             if output_hidden_states:
                 warnings.warn(
