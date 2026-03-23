@@ -44,9 +44,10 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
         use_memory (bool): Enable the memory compression mechanism.
         memory_layers (list[int] | None): Layer indices that receive memory
             augmentation. None means all layers.
-        raw_buffer_max_size (int): Buffer overflow threshold. When the raw buffer
-            exceeds this many tokens, the oldest overflow is compressed into the
-            GLA state. Also determines the self-attention window size.
+        raw_buffer_max_size (int): Window size W. Training sequences are fixed
+            to 2W. In inference, the local attention window is also W.
+        memory_chunk_size (int): Compression chunk size C used by the GLA
+            compressor and by grouped memory reads over the back window.
         gla_num_heads (int | None): Number of heads for GLAMemoryCompressor and
             GLAMemoryReader. Defaults to num_heads.
         gla_expand_k (float): Key expansion ratio for GLA compressor/reader.
@@ -90,6 +91,7 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
         use_memory: bool = True,
         memory_layers: list[int] | None = None,
         raw_buffer_max_size: int = 512,
+        memory_chunk_size: int = 64,
         # ── GLA compressor / reader dims ──────────────────────────────────
         gla_num_heads: int | None = None,
         gla_expand_k: float = 0.5,
@@ -132,9 +134,7 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
         # ── Memory fields ─────────────────────────────────────────────────
         self.use_memory = use_memory
         self.raw_buffer_max_size = raw_buffer_max_size
-        # local_window_size is derived from raw_buffer_max_size to guarantee that
-        # every uncompressed token (in raw_buffer) is always within the attention
-        # window, eliminating any limbo zone between KV cache and GLA memory.
+        self.memory_chunk_size = memory_chunk_size
         self.local_window_size = raw_buffer_max_size
 
         # GLA compressor / reader
@@ -162,6 +162,12 @@ class SimpleMemoryTransformerConfig(PretrainedConfig):
         if training_chunk_size is not None and training_chunk_size <= 0:
             raise ValueError(
                 f'`training_chunk_size` must be positive, got {training_chunk_size}.'
+            )
+        if memory_chunk_size <= 0:
+            raise ValueError(f'`memory_chunk_size` must be positive, got {memory_chunk_size}.')
+        if raw_buffer_max_size % memory_chunk_size != 0:
+            raise ValueError(
+                '`raw_buffer_max_size` must be divisible by `memory_chunk_size` for grouped memory reads.'
             )
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(
